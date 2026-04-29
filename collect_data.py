@@ -20,7 +20,33 @@ for year in years:
             results = session.results[['DriverNumber', 'FullName', 'TeamName', 'GridPosition', 'Position', 'Points']].copy()
             results['Year'] = year
             results['Race'] = event['EventName']
+            results['RoundNumber'] = event['RoundNumber']
             
+            # Get Quali data
+            try:
+                q_session = fastf1.get_session(year, event['EventName'], 'Q')
+                q_session.load(telemetry=False, weather=False, messages=False)
+                q_cols = [c for c in ['Q1', 'Q2', 'Q3'] if c in q_session.results.columns]
+                q_results = q_session.results[['DriverNumber'] + q_cols].copy()
+                
+                def get_quali_time(row):
+                    for q in reversed(q_cols):
+                        if pd.notna(row[q]):
+                            val = row[q]
+                            return val.total_seconds() if hasattr(val, 'total_seconds') else np.nan
+                    return np.nan
+                
+                q_results['QualiLapTime'] = q_results.apply(get_quali_time, axis=1)
+                results = results.merge(q_results[['DriverNumber', 'QualiLapTime']], on='DriverNumber', how='left')
+                
+                # Gap calculation
+                results['TeamFastestQuali'] = results.groupby('TeamName')['QualiLapTime'].transform('min')
+                results['QualiGapToTeammate'] = results['QualiLapTime'] - results['TeamFastestQuali']
+                results.drop(columns=['TeamFastestQuali'], inplace=True)
+            except Exception as qe:
+                results['QualiLapTime'] = np.nan
+                results['QualiGapToTeammate'] = np.nan
+
             # Weather: Track Temperature
             if not session.weather_data.empty:
                 results['TrackTemp'] = session.weather_data['TrackTemp'].mean()
@@ -57,10 +83,23 @@ for year in years:
 
 df = pd.concat(all_races)
 
+# Calculate ChampionshipPositions
+df = df.sort_values(by=['Year', 'RoundNumber'])
+df['CumPoints'] = df.groupby(['Year', 'FullName'])['Points'].cumsum()
+# PreRacePoints drops their current race points so it measures their standing BEFORE the race
+df['PreRacePoints'] = df.groupby(['Year', 'FullName'])['CumPoints'].shift(1).fillna(0)
+df['ChampionshipPosition'] = df.groupby(['Year', 'RoundNumber'])['PreRacePoints'].rank(ascending=False, method='min')
+
 # Fill unrecorded data with the medians so we don't lose rows
 df['TopSpeed'] = df['TopSpeed'].fillna(df['TopSpeed'].median())
 df['MedianPitTime'] = df['MedianPitTime'].fillna(df['MedianPitTime'].median())
 df['TrackTemp'] = df['TrackTemp'].fillna(df['TrackTemp'].median())
+
+# Fix: Drivers who crash in Quali shouldn't get the global median (which makes them look like track record holders)
+# They should get the slowest time of that session.
+df['QualiLapTime'] = df['QualiLapTime'].fillna(df.groupby(['Year', 'Race'])['QualiLapTime'].transform('max'))
+df['QualiGapToTeammate'] = df['QualiGapToTeammate'].fillna(df.groupby(['Year', 'Race'])['QualiGapToTeammate'].transform('max'))
+
 
 df.to_csv('f1_data.csv', index=False)
 print("\nAll data saved to f1_data.csv!")

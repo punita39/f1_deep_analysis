@@ -15,21 +15,25 @@ driver_form = pickle.load(open('driver_form.pkl', 'rb'))
 track_hist  = pickle.load(open('track_history.pkl', 'rb'))
 avg_temps   = pickle.load(open('avg_track_temp.pkl', 'rb'))
 
-RACE = "Abu Dhabi Grand Prix"
+driver_gap       = pickle.load(open('driver_quali_gap.pkl', 'rb'))
+latest_champ_pos = pickle.load(open('latest_champ_pos.pkl', 'rb'))
+
+RACE = "Saudi Arabian Grand Prix"
 
 # (INTERNAL) The script automatically calculates and stores the temperature in this required variable
 TARGET_TRACK_TEMP = avg_temps.get(RACE, 30.0)
 
+# A generic historical race grid for 2024 analysis
 race_entry = [
-    {"driver": "Oscar Piastri",     "team": "McLaren",         "grid": 1},
-    {"driver": "Lando Norris",      "team": "McLaren",         "grid": 2},
-    {"driver": "Max Verstappen",    "team": "Red Bull Racing", "grid": 3},
-    {"driver": "George Russell",    "team": "Mercedes",        "grid": 4},
-    {"driver": "Charles Leclerc",   "team": "Ferrari",         "grid": 5},
-    {"driver": "Lewis Hamilton",    "team": "Ferrari",         "grid": 6},
-    {"driver": "Carlos Sainz",      "team": "Williams",        "grid": 7},
-    {"driver": "Fernando Alonso",   "team": "Aston Martin",    "grid": 8},
-    {"driver": "Pierre Gasly",      "team": "Alpine",          "grid": 9},
+    {"driver": "Max Verstappen",    "team": "Red Bull Racing", "grid": 1},
+    {"driver": "Sergio Perez",      "team": "Red Bull Racing", "grid": 2},
+    {"driver": "Charles Leclerc",   "team": "Ferrari",         "grid": 3},
+    {"driver": "Carlos Sainz",      "team": "Ferrari",         "grid": 4},
+    {"driver": "Lando Norris",      "team": "McLaren",         "grid": 5},
+    {"driver": "Oscar Piastri",     "team": "McLaren",         "grid": 6},
+    {"driver": "George Russell",    "team": "Mercedes",        "grid": 7},
+    {"driver": "Lewis Hamilton",    "team": "Mercedes",        "grid": 8},
+    {"driver": "Fernando Alonso",   "team": "Aston Martin",    "grid": 9},
     {"driver": "Lance Stroll",      "team": "Aston Martin",    "grid": 10},
 ]
 
@@ -38,7 +42,7 @@ if circuit_enc == -1:
     print(f"Warning: Circuit '{RACE}' not found in training data!")
     exit()
 
-print(f"\n{RACE} - Advanced Win Prediction")
+print(f"\n{RACE} - 2024 Baseline Win Prediction")
 print(f"Simulated Track Temperature: {TARGET_TRACK_TEMP:.1f}°C\n")
 
 print(f"{'Driver':<25} {'Team':<20} {'Grid':>4}   {'Win Chance':>10}")
@@ -66,19 +70,30 @@ for entry in race_entry:
     
     driver_rec_form = driver_form.get(driver, 0.0)
     
-    # Track historical performance
-    avg_track_pos = track_hist.get((driver, RACE), 10.0) # default mid-pack if never raced here
+    # Track historical performance (Raw Time)
+    trk_stats = track_hist.get((driver, RACE), {'AvgTrackPosition': 10.0, 'AvgQualiLapTime': 85.0})
+    if isinstance(trk_stats, dict):
+        avg_track_pos = trk_stats.get('AvgTrackPosition', 10.0)
+        avg_quali_time = trk_stats.get('AvgQualiLapTime', 85.0)
+    else:
+        # Fallback
+        avg_track_pos = 10.0
+        avg_quali_time = 85.0
+
+    # For 2024, use the calculated statistics directly from the pickle files
+    champ_pos       = latest_champ_pos.get(driver, 10.0)
+    gap_to_teammate = driver_gap.get(driver, 0.0)
     
-    # Create DataFrame with proper feature names to prevent Scikit-learn warnings!
     import pandas as pd
     col_names = ['GridPosition', 'TeamEncoded', 'DriverEncoded', 'CircuitEncoded', 
                  'TeamRecentForm', 'DriverRecentForm', 'TeamTopSpeed', 'TeamPitTime', 
-                 'AvgTrackPosition', 'TrackTemp']
+                 'AvgTrackPosition', 'TrackTemp', 'QualiLapTime', 'QualiGapToTeammate', 'ChampionshipPosition']
                  
     features_df = pd.DataFrame([[
         grid, team_enc, driver_enc, circuit_enc,
         team_rec_form, driver_rec_form, team_top_speed, team_pit_time,
-        avg_track_pos, TARGET_TRACK_TEMP
+        avg_track_pos, TARGET_TRACK_TEMP,
+        avg_quali_time, gap_to_teammate, champ_pos
     ]], columns=col_names)
 
     proba = model.predict_proba(features_df)
