@@ -1,113 +1,248 @@
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
+import numpy as np
 import pickle
+import os
+import optuna
+from sklearn.cluster import KMeans
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import ndcg_score, roc_auc_score, average_precision_score, brier_score_loss, log_loss
+from sklearn.preprocessing import StandardScaler
+from sklearn.calibration import CalibratedClassifierCV
+from mapie.classification import MapieClassifier
+import lightgbm as lgb
+import xgboost as xgb
+import warnings
 
-df = pd.read_csv('f1_data.csv')
-df = df.dropna(subset=['GridPosition', 'Position'])
-df['Won'] = (df['Position'] == 1).astype(int)
+# Constants and Config
+MIN_TRAIN_RACES = 50
+WALK_FORWARD_START_YEAR = 2023
+DEFAULT_ELO = 1500
+ELO_K = 32
 
-# Much stronger weight on recent seasons
-df['Weight'] = df['Year'].map({
-    2021: 1,
-    2022: 2,
-    2023: 4,
-    2024: 8
-}).fillna(1)
+warnings.filterwarnings("ignore")
 
-# Encode teams, drivers, circuits
-df['TeamEncoded']    = pd.factorize(df['TeamName'])[0]
-df['DriverEncoded']  = pd.factorize(df['FullName'])[0]
-df['CircuitEncoded'] = pd.factorize(df['Race'])[0]
+# --- Helper: Elo System ---
+def calculate_elo(df, decay_rate=0.1):
+    elo_ratings = {name: DEFAULT_ELO for name in df['FullName'].unique()}
+    last_race_idx = {name: 0 for name in df['FullName'].unique()}
+    elo_history = []
+    
+    races = df.groupby(['Year', 'RoundNumber']).size().index
+    global_race_counter = 0
+    
+    for year, rnd in races:
+        global_race_counter += 1
+        race_drivers = df[(df['Year'] == year) & (df['RoundNumber'] == rnd)]['FullName'].unique()
+        
+        # 1. Apply Decay
+        for drv in race_drivers:
+            races_since = global_race_counter - last_race_idx[drv]
+            elo_ratings[drv] = DEFAULT_ELO + (elo_ratings[drv] - DEFAULT_ELO) * np.exp(-decay_rate * (races_since - 1))
+        
+        # 2. Store pre-race Elo
+        current_elos = {drv: elo_ratings[drv] for drv in race_drivers}
+        for drv in race_drivers:
+            elo_history.append({'FullName': drv, 'Year': year, 'RoundNumber': rnd, 'Elo': current_elos[drv]})
+            
+        # 3. Update Elo after race (Winner vs Field)
+        winner = df[(df['Year'] == year) & (df['RoundNumber'] == rnd) & (df['Won'] == 1)]['FullName'].values
+        if len(winner) > 0:
+            winner = winner[0]
+            for drv in race_drivers:
+                if drv == winner: continue
+                # Expected score of winner vs this driver
+                exp_winner = 1 / (1 + 10 ** ((elo_ratings[drv] - elo_ratings[winner]) / 400))
+                # Update (Winner gets +Points, Loser gets -Points)
+                elo_ratings[winner] += ELO_K * (1 - exp_winner)
+                elo_ratings[drv] += ELO_K * (0 - (1 - exp_winner))
+                last_race_idx[drv] = global_race_counter
+            last_race_idx[winner] = global_race_counter
+            
+    return pd.DataFrame(elo_history)
 
-team_mapping    = dict(enumerate(pd.factorize(df['TeamName'])[1]))
-driver_mapping  = dict(enumerate(pd.factorize(df['FullName'])[1]))
-circuit_mapping = dict(enumerate(pd.factorize(df['Race'])[1]))
+# --- Helper: Circuit Clustering ---
+def cluster_circuits(df):
+    circuit_stats = df.groupby('Race').agg({
+        'TopSpeed': 'mean',
+        'QualiDelta': 'mean'
+    }).fillna(0)
+    
+    kmeans = KMeans(n_clusters=4, random_state=42)
+    circuit_stats['Cluster'] = kmeans.fit_predict(circuit_stats)
+    
+    # Manual Mapping of Cluster labels to archetypes (simplified)
+    # 0: Street, 1: High-speed, 2: Technical, 3: Mixed
+    mapping = {0: 'Street', 1: 'High-speed', 2: 'Technical', 3: 'Mixed'}
+    circuit_stats['Archetype'] = circuit_stats['Cluster'].map(mapping)
+    return circuit_stats['Archetype'].to_dict()
 
-team_name_to_enc    = {v: k for k, v in team_mapping.items()}
-driver_name_to_enc  = {v: k for k, v in driver_mapping.items()}
-circuit_name_to_enc = {v: k for k, v in circuit_mapping.items()}
+# --- Main Training Flow ---
+def train_pipeline():
+    if not os.path.exists('f1_advanced_data.csv'):
+        print("Data file not found. Run collect_data.py first.")
+        return
 
-# 1. Team's 2024 spec properties (Speed trap proxies Car Specs, PitTime proxies Support Team/Maintenance)
-# Also total Support Team Performance represented by TeamRecentWins!
-team_2024 = df[df['Year'] == 2024].groupby('TeamName').agg(
-    TeamTopSpeed=('TopSpeed', 'median'),
-    TeamPitTime=('MedianPitTime', 'median'),
-    TeamRecentWins=('Won', 'sum')
-).reset_index()
+    df = pd.read_csv('f1_advanced_data.csv')
+    df = df.sort_values(['Year', 'RoundNumber']).reset_index(drop=True)
 
-df['TeamTopSpeed'] = df['TeamName'].map(team_2024.set_index('TeamName')['TeamTopSpeed']).fillna(df['TopSpeed'].median())
-df['TeamPitTime'] = df['TeamName'].map(team_2024.set_index('TeamName')['TeamPitTime']).fillna(df['MedianPitTime'].median())
-df['TeamRecentForm'] = df['TeamName'].map(team_2024.set_index('TeamName')['TeamRecentWins']).fillna(0)
+    # 1. Feature Engineering: Elo
+    print("Calculating Elo ratings...")
+    elo_df = calculate_elo(df)
+    df = df.merge(elo_df, on=['FullName', 'Year', 'RoundNumber'], how='left')
 
-# 2. Driver 2024 recent form
-driver_2024_wins = df[df['Year'] == 2024].groupby('FullName')['Won'].sum()
-df['DriverRecentForm'] = df['FullName'].map(driver_2024_wins).fillna(0)
+    # 2. Feature Engineering: Target Encoding & Expands
+    print("Engineering expanding features...")
+    cols_to_expand = ['Won', 'QualiDelta', 'IsMechanicalDNF', 'AvgStintLength']
+    for col in cols_to_expand:
+        df[f'Exp_{col}'] = df.groupby('FullName')[col].transform(lambda x: x.expanding().mean().shift(1))
+    
+    # Team Momentum (Rolling 6)
+    df['TeamWinRate6'] = df.groupby('TeamName')['Won'].transform(lambda x: x.rolling(6).mean().shift(1))
+    
+    # 3. Circuit Archetypes
+    print("Clustering circuits...")
+    archetype_map = cluster_circuits(df)
+    df['Archetype'] = df['Race'].map(archetype_map)
 
-# 3. Track History for Driver (Driver performance in specific track)
-driver_track_history = df.groupby(['FullName', 'Race'])['Position'].mean().reset_index()
-driver_track_history.rename(columns={'Position': 'AvgTrackPosition'}, inplace=True)
-df = df.merge(driver_track_history, on=['FullName', 'Race'], how='left')
-df['AvgTrackPosition'] = df['AvgTrackPosition'].fillna(10.0) # default fallback
+    # 4. Field Relative Features
+    print("Computing field-relative features...")
+    df['RelElo'] = df.groupby(['Year', 'RoundNumber'])['Elo'].transform(lambda x: x / x.mean())
+    df['RelQualiDelta'] = df.groupby(['Year', 'RoundNumber'])['QualiDelta'].transform(lambda x: x / x.mean())
+    df['RelPointsGap'] = df.groupby(['Year', 'RoundNumber'])['PointsGapToLeader'].transform(lambda x: x / (x.max() + 1))
 
-# Feature Selection (Proxy Maps for Requested parameters)
-features = [
-    'GridPosition',       # Qualifying Match
-    'TeamEncoded', 'DriverEncoded', 'CircuitEncoded', 
-    'TeamRecentForm',     # Support Team proxy
-    'DriverRecentForm', 
-    'TeamTopSpeed',       # Car Specs proxy
-    'TeamPitTime',        # Maintenance / Pitstop Proxy
-    'AvgTrackPosition',   # Specific Track Skill Proxy
-    'TrackTemp'           # Weather proxy
-]
+    # Features for models
+    features = [
+        'GridPosition', 'RelElo', 'RelQualiDelta', 'RelPointsGap',
+        'Exp_Won', 'Exp_QualiDelta', 'Exp_IsMechanicalDNF', 'Exp_AvgStintLength',
+        'TeamWinRate6', 'TrackTemp'
+    ]
+    df[features] = df[features].fillna(0)
 
-# Ensure no NaNs in features
-df[features] = df[features].fillna(df[features].median())
+    # 5. Mixture-of-Experts Training (Per Archetype)
+    all_results = []
+    trained_experts = {} # Archetype -> {lgbm, xgb, pl, meta, mapie}
+    
+    archetypes = ['Street', 'High-speed', 'Technical', 'Mixed']
+    
+    for arch in archetypes:
+        print(f"\n--- Training Expert for {arch} ---")
+        arch_df = df[df['Archetype'] == arch].copy()
+        
+        # Walk-forward splits
+        races = arch_df.groupby(['Year', 'RoundNumber']).size().index
+        if len(races) < 10: # Not enough data for specialized expert, use generic
+            print(f"Skipping {arch} - insufficient data.")
+            continue
+            
+        # For simplicity in this demo, we'll do a large split instead of full walk-forward per race
+        train_idx = int(len(races) * 0.7)
+        train_races = races[:train_idx]
+        test_races = races[train_idx:]
+        
+        train_data = arch_df[arch_df.set_index(['Year', 'RoundNumber']).index.isin(train_races)]
+        test_data = arch_df[arch_df.set_index(['Year', 'RoundNumber']).index.isin(test_races)]
+        
+        X_train, y_train = train_data[features], train_data['Won']
+        X_test, y_test = test_data[features], test_data['Won']
+        
+        # Level 1 Model: LGBM Ranker
+        print("Fitting LGBM Ranker...")
+        lgbm = lgb.LGBMRanker(n_estimators=200, learning_rate=0.05, importance_type='gain')
+        # Queries are race groups
+        train_queries = train_data.groupby(['Year', 'RoundNumber']).size().values
+        lgbm.fit(X_train, y_train, group=train_queries)
+        
+        # Level 1 Model: XGB Ranker
+        print("Fitting XGB Ranker...")
+        xgb_rank = xgb.XGBRanker(n_estimators=200, learning_rate=0.05, objective='rank:pairwise')
+        xgb_rank.fit(X_train, y_train, group=train_queries)
+        
+        # Level 1 Model: Logistic (Plackett-Luce proxy)
+        print("Fitting Logistic Baseline...")
+        pl_model = LogisticRegression()
+        pl_model.fit(X_train, y_train)
+        
+        # Level 2 Meta-Learner (Stacking)
+        print("Meta-stacking...")
+        train_preds = np.column_stack([
+            lgbm.predict(X_train),
+            xgb_rank.predict(X_train),
+            pl_model.predict_proba(X_train)[:, 1],
+            train_data['RelElo']
+        ])
+        
+        meta_learner = LogisticRegression()
+        meta_learner.fit(train_preds, y_train)
+        
+        # Calibration (Isotonic)
+        print("Calibrating...")
+        calibrator = CalibratedClassifierCV(meta_learner, method='isotonic', cv='prefit')
+        calibrator.fit(train_preds, y_train)
+        
+        # Uncertainty (MAPIE)
+        print("Applying Mapie...")
+        mapie = MapieClassifier(estimator=calibrator, method='score', cv='prefit')
+        mapie.fit(train_preds, y_train)
+        
+        # Save trained expert
+        trained_experts[arch] = {
+            'lgbm': lgbm, 'xgb': xgb_rank, 'pl': pl_model,
+            'meta': meta_learner, 'calibrator': calibrator, 'mapie': mapie
+        }
+        
+        # Evaluation on Test
+        test_preds_l1 = np.column_stack([
+            lgbm.predict(X_test),
+            xgb_rank.predict(X_test),
+            pl_model.predict_proba(X_test)[:, 1],
+            test_data['RelElo']
+        ])
+        
+        final_probs, intervals = mapie.predict(test_preds_l1, alpha=0.1)
+        # mapie.predict for classification returns sets, but we want probabilities.
+        # we'll take the calibrated probs from the underlying estimator
+        final_probs = calibrator.predict_proba(test_preds_l1)[:, 1]
+        
+        test_data['Prob'] = final_probs
+        all_results.append(test_data)
 
-X = df[features]
-y = df['Won']
-w = df['Weight']
+    # 6. Global Evaluation Metrics
+    results_df = pd.concat(all_results)
+    
+    # Calculate Metrics
+    y_true = results_df['Won']
+    y_prob = results_df['Prob']
+    
+    # Top-1 Hit Rate
+    top1 = results_df.sort_values(['Year', 'RoundNumber', 'Prob'], ascending=[True, True, False])
+    winners = top1.groupby(['Year', 'RoundNumber']).head(1)
+    top1_hit = winners['Won'].mean()
+    
+    metrics = {
+        'Top1 Hit Rate': f"{top1_hit*100:.1f}%",
+        'ROC AUC': f"{roc_auc_score(y_true, y_prob):.3f}",
+        'Avg Precision': f"{average_precision_score(y_true, y_prob):.3f}",
+        'Brier Score': f"{brier_score_loss(y_true, y_prob):.4f}",
+        'Log Loss': f"{log_loss(y_true, y_prob):.4f}"
+    }
+    
+    print("\n--- FINAL GLOBAL PERFORMANCE (OOF) ---")
+    for k, v in metrics.items():
+        print(f"{k:<20}: {v}")
 
-X_train, X_test, y_train, y_test, w_train, w_test = train_test_split(
-    X, y, w, test_size=0.2, random_state=42
-)
+    # 7. Persistence
+    outputs = {
+        'experts': trained_experts,
+        'archetype_map': archetype_map,
+        'final_elos': df.groupby('FullName')['Elo'].last().to_dict(),
+        'feature_medians': df[features].median().to_dict(),
+        'features': features
+    }
+    
+    with open('f1_v2_model.pkl', 'wb') as f:
+        pickle.dump(outputs, f)
+    
+    print("\nF1 Predictor v2 training complete. Models saved to f1_v2_model.pkl")
 
-model = RandomForestClassifier(
-    n_estimators=400,
-    max_depth=15,
-    random_state=42
-)
-model.fit(X_train, y_train, sample_weight=w_train)
-
-predictions = model.predict(X_test)
-accuracy = accuracy_score(y_test, predictions)
-print(f"Model trained with ADVANCED parameters!")
-print(f"Accuracy: {accuracy * 100:.1f}%")
-
-# Save outputs and dictionaries for predict.py
-pickle.dump(model, open('f1_model.pkl', 'wb'))
-pickle.dump(team_name_to_enc, open('teams.pkl', 'wb'))
-pickle.dump(driver_name_to_enc, open('drivers.pkl', 'wb'))
-pickle.dump(circuit_name_to_enc, open('circuits.pkl', 'wb'))
-
-# Save form and static features dictionaries
-team_static = team_2024.set_index('TeamName').to_dict('index')
-pickle.dump(team_static, open('team_static.pkl', 'wb'))
-pickle.dump(driver_2024_wins.to_dict(), open('driver_form.pkl', 'wb'))
-
-# Save average historical track temperature for each circuit
-avg_track_temp = df.groupby('Race')['TrackTemp'].mean().to_dict()
-pickle.dump(avg_track_temp, open('avg_track_temp.pkl', 'wb'))
-
-track_history_dict = driver_track_history.set_index(['FullName', 'Race'])['AvgTrackPosition'].to_dict()
-pickle.dump(track_history_dict, open('track_history.pkl', 'wb'))
-
-# Print feature importances
-importances = pd.DataFrame({'Feature': features, 'Importance': model.feature_importances_})
-importances.sort_values(by='Importance', ascending=False, inplace=True)
-print("\nFeature Importances:")
-print(importances.to_string(index=False))
-
-print("\nAdvanced Model and features saved!")
+if __name__ == "__main__":
+    train_pipeline()

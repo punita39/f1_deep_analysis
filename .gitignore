@@ -4,3 +4,5 @@ cache/
 *.sqlite
 *.csv
 __pycache__/
+.env
+.venv/
